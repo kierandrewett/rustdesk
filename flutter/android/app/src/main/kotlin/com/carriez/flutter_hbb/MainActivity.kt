@@ -37,6 +37,9 @@ import com.hjq.permissions.XXPermissions
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import android.view.InputDevice
+import android.view.KeyEvent
+import android.view.MotionEvent
 import kotlin.concurrent.thread
 import java.io.File
 import java.io.FileInputStream
@@ -52,6 +55,8 @@ class MainActivity : FlutterActivity() {
     }
 
     private val channelTag = "mChannel"
+    private val controllerChannelTag = "org.rustdesk.rustdesk/controller"
+    private var controllerMethodChannel: MethodChannel? = null
     private val logTag = "mMainActivity"
     private var mainService: MainService? = null
     private sealed class PendingPicker {
@@ -86,6 +91,10 @@ class MainActivity : FlutterActivity() {
             flutterEngine.dartExecutor.binaryMessenger,
             channelTag
         )
+        controllerMethodChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            controllerChannelTag
+        )
         initFlutterChannel(flutterMethodChannel!!)
         thread {
             try {
@@ -106,6 +115,55 @@ class MainActivity : FlutterActivity() {
             )
         }
     }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        val source = event.source
+        if (source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK) {
+            val axes = mapOf(
+                "x" to event.getAxisValue(MotionEvent.AXIS_X),
+                "y" to event.getAxisValue(MotionEvent.AXIS_Y),
+                "z" to event.getAxisValue(MotionEvent.AXIS_Z),
+                "rz" to event.getAxisValue(MotionEvent.AXIS_RZ),
+                "leftTrigger" to event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
+                "rightTrigger" to event.getAxisValue(MotionEvent.AXIS_RTRIGGER)
+            )
+            controllerMethodChannel?.invokeMethod("on_controller_motion", axes)
+            return true
+        }
+        return super.dispatchGenericMotionEvent(event)
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.isFromSource(InputDevice.SOURCE_GAMEPAD) &&
+            event.repeatCount == 0 &&
+            event.keyCode == KeyEvent.KEYCODE_BUTTON_L2
+        ) {
+            controllerMethodChannel?.invokeMethod(
+                "on_controller_button",
+                mapOf(
+                    "button" to "leftTrigger",
+                    "pressed" to (event.action == KeyEvent.ACTION_DOWN)
+                )
+            )
+            return true
+        }
+        if (event.isFromSource(InputDevice.SOURCE_GAMEPAD) &&
+            event.repeatCount == 0 &&
+            event.keyCode == KeyEvent.KEYCODE_BUTTON_R2
+        ) {
+            controllerMethodChannel?.invokeMethod(
+                "on_controller_button",
+                mapOf(
+                    "button" to "rightTrigger",
+                    "pressed" to (event.action == KeyEvent.ACTION_DOWN)
+                )
+            )
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+
 
     private fun requestMediaProjection() {
         val intent = Intent(this, PermissionRequestTransparentActivity::class.java).apply {

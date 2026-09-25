@@ -25,6 +25,9 @@ import '../../utils/image.dart';
 import '../widgets/dialog.dart';
 import '../widgets/custom_scale_widget.dart';
 
+const MethodChannel _controllerChannel =
+    MethodChannel("org.rustdesk.rustdesk/controller");
+
 final initText = '1' * 1024;
 
 // Workaround for Android (default input method, Microsoft SwiftKey keyboard) when using physical keyboard.
@@ -77,6 +80,123 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   Worker? _waylandKeyboardGateWorker;
   bool _waylandKeyboardGateInitialized = false;
+  Timer? _controllerMoveTimer;
+  Timer? _controllerLeftTriggerTimer;
+  Timer? _controllerRightTriggerTimer;
+  bool _controllerLeftTriggerPressed = false;
+  bool _controllerLeftMouseDown = false;
+  bool _controllerRightMouseDown = false;
+  double _controllerStickX = 0;
+  double _controllerStickY = 0;
+  static const double _controllerStickDeadZone = 0.18;
+  static const double _controllerStickSpeed = 3.0;
+  static const double _controllerTriggerThreshold = 0.72;
+  static const Duration _controllerClickDebounce = Duration(milliseconds: 70);
+
+  void _onControllerMotion(Object? arguments) {
+    if (!mounted || !isAndroid || _showEdit || arguments is! Map) return;
+    final axes = arguments.map((key, value) =>
+        MapEntry(key.toString(), (value as num).toDouble()));
+    _setControllerTrigger(axes["leftTrigger"] ?? 0, rightButton: false);
+    _setControllerTrigger(axes["rightTrigger"] ?? 0, rightButton: true);
+    _controllerStickX = _applyControllerDeadZone(axes["x"] ?? 0);
+    _controllerStickY = _applyControllerDeadZone(axes["y"] ?? 0);
+    if (_controllerStickX == 0 && _controllerStickY == 0) {
+      _controllerMoveTimer?.cancel();
+      _controllerMoveTimer = null;
+      return;
+    }
+    _controllerMoveTimer ??= Timer.periodic(
+      const Duration(milliseconds: 16),
+      (_) {
+        if (!mounted || _showEdit) return;
+        final delta = Offset(_controllerStickX, _controllerStickY) *
+            _controllerStickSpeed;
+        if (inputModel.relativeMouseMode.value) {
+          inputModel.sendMobileRelativeMouseMove(delta.dx, delta.dy);
+        } else {
+          gFFI.cursorModel.updatePan(delta, Offset.zero, false);
+        }
+      },
+    );
+  }
+
+  double _applyControllerDeadZone(double value) {
+    if (value.abs() <= _controllerStickDeadZone) return 0;
+    final scaled = (value.abs() - _controllerStickDeadZone) /
+        (1 - _controllerStickDeadZone);
+    return value.sign * scaled * scaled;
+  }
+
+  void _onControllerButton(Object? arguments) {
+    if (!mounted || !isAndroid || _showEdit || arguments is! Map) return;
+    final button = arguments["button"];
+    final pressed = arguments["pressed"];
+    if (pressed is! bool) return;
+    if (button == "leftTrigger") {
+      _setControllerTrigger(pressed ? 1 : 0, rightButton: false);
+    } else if (button == "rightTrigger") {
+      _setControllerTrigger(pressed ? 1 : 0, rightButton: true);
+    }
+  }
+
+  void _setControllerTrigger(double value, {required bool rightButton}) {
+    final pressed = value >= _controllerTriggerThreshold;
+    final wasPressed = rightButton
+        ? _controllerRightTriggerPressed
+        : _controllerLeftTriggerPressed;
+    if (pressed == wasPressed) return;
+    if (rightButton) {
+      _controllerRightTriggerPressed = pressed;
+    } else {
+      _controllerLeftTriggerPressed = pressed;
+    }
+    final timer =
+        rightButton ? _controllerRightTriggerTimer : _controllerLeftTriggerTimer;
+    timer?.cancel();
+    final button = rightButton ? MouseButtons.right : MouseButtons.left;
+    final isMouseDown = rightButton
+        ? _controllerRightMouseDown
+        : _controllerLeftMouseDown;
+    if (pressed) {
+      final debounce = Timer(_controllerClickDebounce, () {
+        final stillPressed = rightButton
+            ? _controllerRightTriggerPressed
+            : _controllerLeftTriggerPressed;
+        if (!mounted || !stillPressed) return;
+        if (rightButton) {
+          _controllerRightMouseDown = true;
+        } else {
+          _controllerLeftMouseDown = true;
+        }
+        inputModel.tapDown(button);
+      });
+      if (rightButton) {
+        _controllerRightTriggerTimer = debounce;
+      } else {
+        _controllerLeftTriggerTimer = debounce;
+      }
+      return;
+    }
+    if (isMouseDown) {
+      inputModel.tapUp(button);
+      if (rightButton) {
+        _controllerRightMouseDown = false;
+        _controllerRightTriggerTimer = null;
+      } else {
+        _controllerLeftMouseDown = false;
+        _controllerLeftTriggerTimer = null;
+      }
+    } else {
+      timer?.cancel();
+      inputModel.tap(button);
+      if (rightButton) {
+        _controllerRightTriggerTimer = null;
+      } else {
+        _controllerLeftTriggerTimer = null;
+      }
+    }
+  }
 
   InputModel get inputModel => gFFI.inputModel;
   SessionID get sessionId => gFFI.sessionId;
@@ -126,6 +246,16 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
 
     inputModel.keyboardInputAllowed = true;
+    if (isAndroid) {
+      _controllerChannel.setMethodCallHandler((call) async {
+        if (call.method == "on_controller_motion") {
+          _onControllerMotion(call.arguments);
+        } else if (call.method == "on_controller_button") {
+          _onControllerButton(call.arguments);
+        }
+        return null;
+      });
+    }
 
     // Wayland sessions may use clipboard-based text input on the controlled side.
     // Require explicit user confirmation before allowing soft-keyboard and
@@ -142,6 +272,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   @override
   Future<void> dispose() async {
+    _controllerLeftTriggerTimer?.cancel();
+    _controllerRightTriggerTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     // Close the session up-front. `gFFI.close()` below only calls `sessionClose`
     // after several awaits (canvas save, image update, the `enable_soft_keyboard`
@@ -150,7 +282,17 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     // down. The reconnect then re-attaches to the leaked session and is stuck on
     // "Connecting...". Dispatching it here makes teardown happen synchronously on
     // pop; the `sessionClose` in `gFFI.close()` becomes a no-op once removed.
+    if (isAndroid) {
+      _controllerChannel.setMethodCallHandler(null);
+    }
     unawaited(bind.sessionClose(sessionId: sessionId));
+    _controllerMoveTimer?.cancel();
+    if (_controllerLeftMouseDown) {
+      inputModel.tapUp(MouseButtons.left);
+    }
+    if (_controllerRightMouseDown) {
+      inputModel.tapUp(MouseButtons.right);
+    }
     // https://github.com/flutter/flutter/issues/64935
     super.dispose();
     gFFI.dialogManager.hideMobileActionsOverlay(store: false);
