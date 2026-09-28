@@ -76,6 +76,7 @@ class MainActivity : FlutterActivity() {
     )
 
     private var pendingPicker: PendingPicker? = null
+    private val controllerTriggerKeyDevices = mutableSetOf<Int>()
 
     private var isAudioStart = false
     private val audioRecordHandle = AudioRecordHandle(this, { false }, { isAudioStart })
@@ -119,13 +120,14 @@ class MainActivity : FlutterActivity() {
     override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
         val source = event.source
         if (source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK) {
+            val usesTriggerKeys = controllerTriggerKeyDevices.contains(event.deviceId)
             val axes = mapOf(
                 "x" to event.getAxisValue(MotionEvent.AXIS_X),
                 "y" to event.getAxisValue(MotionEvent.AXIS_Y),
                 "z" to event.getAxisValue(MotionEvent.AXIS_Z),
                 "rz" to event.getAxisValue(MotionEvent.AXIS_RZ),
-                "leftTrigger" to event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
-                "rightTrigger" to event.getAxisValue(MotionEvent.AXIS_RTRIGGER)
+                "leftTrigger" to if (usesTriggerKeys) 0f else event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
+                "rightTrigger" to if (usesTriggerKeys) 0f else event.getAxisValue(MotionEvent.AXIS_RTRIGGER)
             )
             controllerMethodChannel?.invokeMethod("on_controller_motion", axes)
             return true
@@ -138,6 +140,7 @@ class MainActivity : FlutterActivity() {
             event.repeatCount == 0 &&
             event.keyCode == KeyEvent.KEYCODE_BUTTON_L2
         ) {
+            controllerTriggerKeyDevices.add(event.deviceId)
             controllerMethodChannel?.invokeMethod(
                 "on_controller_button",
                 mapOf(
@@ -151,6 +154,7 @@ class MainActivity : FlutterActivity() {
             event.repeatCount == 0 &&
             event.keyCode == KeyEvent.KEYCODE_BUTTON_R2
         ) {
+            controllerTriggerKeyDevices.add(event.deviceId)
             controllerMethodChannel?.invokeMethod(
                 "on_controller_button",
                 mapOf(
@@ -421,6 +425,9 @@ class MainActivity : FlutterActivity() {
                     }
                     result.success(true)
 
+                }
+                "is_meta_quest" -> {
+                    result.success(Build.MODEL.contains("Quest", ignoreCase = true))
                 }
                 "try_sync_clipboard" -> {
                     rdClipboardManager?.syncClipboard(true)

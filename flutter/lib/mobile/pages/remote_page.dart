@@ -68,7 +68,12 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   String _value = '';
   Orientation? _currentOrientation;
   final _uniqueKey = UniqueKey();
+  Size? _lastCanvasSize;
+  double? _lastDevicePixelRatio;
   Timer? _iosKeyboardWorkaroundTimer;
+  Orientation? _pendingOrientation;
+  Timer? _orientationChangeTimer;
+  bool _canvasSizeUpdateScheduled = false;
 
   final _blockableOverlayState = BlockableOverlayState();
 
@@ -88,10 +93,14 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   bool _controllerRightMouseDown = false;
   double _controllerStickX = 0;
   double _controllerStickY = 0;
+  double _controllerTargetX = 0;
+  double _controllerTargetY = 0;
   static const double _controllerStickDeadZone = 0.18;
   static const double _controllerStickSpeed = 3.0;
   static const double _controllerTriggerThreshold = 0.72;
+  static const double _controllerTriggerReleaseThreshold = 0.48;
   static const Duration _controllerClickDebounce = Duration(milliseconds: 70);
+  static const double _controllerMotionSmoothing = 0.35;
 
   void _onControllerMotion(Object? arguments) {
     if (!mounted || !isAndroid || _showEdit || arguments is! Map) return;
@@ -99,9 +108,10 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
         MapEntry(key.toString(), (value as num).toDouble()));
     _setControllerTrigger(axes["leftTrigger"] ?? 0, rightButton: false);
     _setControllerTrigger(axes["rightTrigger"] ?? 0, rightButton: true);
-    _controllerStickX = _applyControllerDeadZone(axes["x"] ?? 0);
-    _controllerStickY = _applyControllerDeadZone(axes["y"] ?? 0);
-    if (_controllerStickX == 0 && _controllerStickY == 0) {
+    _controllerTargetX = _applyControllerDeadZone(axes["x"] ?? 0);
+    _controllerTargetY = _applyControllerDeadZone(axes["y"] ?? 0);
+    if (_controllerTargetX == 0 && _controllerTargetY == 0 &&
+        _controllerStickX.abs() < 0.01 && _controllerStickY.abs() < 0.01) {
       _controllerMoveTimer?.cancel();
       _controllerMoveTimer = null;
       return;
@@ -110,6 +120,18 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       const Duration(milliseconds: 16),
       (_) {
         if (!mounted || _showEdit) return;
+        _controllerStickX = _smoothControllerAxis(
+            _controllerStickX, _controllerTargetX);
+        _controllerStickY = _smoothControllerAxis(
+            _controllerStickY, _controllerTargetY);
+        if (_controllerTargetX == 0 &&
+            _controllerTargetY == 0 &&
+            _controllerStickX == 0 &&
+            _controllerStickY == 0) {
+          _controllerMoveTimer?.cancel();
+          _controllerMoveTimer = null;
+          return;
+        }
         final delta = Offset(_controllerStickX, _controllerStickY) *
             _controllerStickSpeed;
         if (inputModel.relativeMouseMode.value) {
@@ -128,6 +150,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     return value.sign * scaled * scaled;
   }
 
+  double _smoothControllerAxis(double current, double target) {
+    final smoothed = current + (target - current) * _controllerMotionSmoothing;
+    return smoothed.abs() < 0.01 && target == 0 ? 0 : smoothed;
+  }
+
   void _onControllerButton(Object? arguments) {
     if (!mounted || !isAndroid || _showEdit || arguments is! Map) return;
     final button = arguments["button"];
@@ -141,10 +168,12 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   }
 
   void _setControllerTrigger(double value, {required bool rightButton}) {
-    final pressed = value >= _controllerTriggerThreshold;
     final wasPressed = rightButton
         ? _controllerRightTriggerPressed
         : _controllerLeftTriggerPressed;
+    final pressed = wasPressed
+        ? value > _controllerTriggerReleaseThreshold
+        : value >= _controllerTriggerThreshold;
     if (pressed == wasPressed) return;
     if (rightButton) {
       _controllerRightTriggerPressed = pressed;
@@ -240,8 +269,20 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       if (gFFI.recordingModel.start) {
         showToast(translate('Automatically record outgoing sessions'));
       }
-      _disableAndroidSoftKeyboard(
-          isKeyboardVisible: keyboardVisibilityController.isVisible);
+      if (isAndroid) {
+        gFFI.invokeMethodWithResult<bool>("is_meta_quest").then((isQuest) {
+          if (!mounted) return;
+          if (isQuest == true) {
+            openKeyboard();
+          } else {
+            _disableAndroidSoftKeyboard(
+                isKeyboardVisible: keyboardVisibilityController.isVisible);
+          }
+        });
+      } else {
+        _disableAndroidSoftKeyboard(
+            isKeyboardVisible: keyboardVisibilityController.isVisible);
+      }
     });
     WidgetsBinding.instance.addObserver(this);
 
@@ -312,6 +353,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
         overlays: SystemUiOverlay.values);
     WakelockManager.disable(_uniqueKey);
+    _orientationChangeTimer?.cancel();
     await keyboardSubscription.cancel();
     removeSharedStates(widget.id);
     // `on_voice_call_closed` should be called when the connection is ended.
@@ -647,26 +689,76 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                     child: isWebDesktop
                         ? getBodyForDesktopWithListener()
                         : SafeArea(
-                            child:
-                                OrientationBuilder(builder: (ctx, orientation) {
-                              if (_currentOrientation != orientation) {
-                                Timer(const Duration(milliseconds: 200), () {
-                                  gFFI.dialogManager
-                                      .resetMobileActionsOverlay(ffi: gFFI);
-                                  _currentOrientation = orientation;
-                                  gFFI.canvasModel.updateViewStyle();
-                                });
-                              }
-                              return Container(
-                                color: MyTheme.canvasColor,
-                                child: inputModel.isPhysicalMouse.value
-                                    ? getBodyForMobile()
-                                    : RawTouchGestureDetectorRegion(
-                                        child: getBodyForMobile(),
-                                        ffi: gFFI,
-                                      ),
-                              );
-                            }),
+                            child: LayoutBuilder(
+                              builder: (context, constraints) {
+                                final maxWidth = constraints.maxWidth;
+                                final maxHeight = constraints.maxHeight;
+                                if (maxWidth.isFinite && maxHeight.isFinite) {
+                                  final size = Size(maxWidth, maxHeight);
+                                  final devicePixelRatio =
+                                      MediaQuery.devicePixelRatioOf(context);
+                                  if (_lastCanvasSize != size ||
+                                      _lastDevicePixelRatio !=
+                                          devicePixelRatio) {
+                                    _lastCanvasSize = size;
+                                    _lastDevicePixelRatio = devicePixelRatio;
+                                    if (!_canvasSizeUpdateScheduled) {
+                                      _canvasSizeUpdateScheduled = true;
+                                      WidgetsBinding.instance
+                                          .addPostFrameCallback((_) {
+                                        _canvasSizeUpdateScheduled = false;
+                                        final currentSize = _lastCanvasSize;
+                                        if (!mounted || currentSize == null) {
+                                          return;
+                                        }
+                                        gFFI.canvasModel.updateViewStyle();
+                                        inputModel
+                                            .updateImageWidgetSize(currentSize);
+                                      });
+                                    }
+                                  }
+                                }
+                                return OrientationBuilder(
+                                  builder: (ctx, orientation) {
+                                    if (_currentOrientation == orientation) {
+                                      _orientationChangeTimer?.cancel();
+                                      _orientationChangeTimer = null;
+                                      _pendingOrientation = null;
+                                    } else if (_pendingOrientation !=
+                                        orientation) {
+                                      _orientationChangeTimer?.cancel();
+                                      _pendingOrientation = orientation;
+                                      _orientationChangeTimer = Timer(
+                                        const Duration(milliseconds: 200),
+                                        () {
+                                          _orientationChangeTimer = null;
+                                          _pendingOrientation = null;
+                                          if (!mounted ||
+                                              _currentOrientation ==
+                                                  orientation) {
+                                            return;
+                                          }
+                                          gFFI.dialogManager
+                                              .resetMobileActionsOverlay(
+                                                  ffi: gFFI);
+                                          _currentOrientation = orientation;
+                                          gFFI.canvasModel.updateViewStyle();
+                                        },
+                                      );
+                                    }
+                                    return Container(
+                                      color: MyTheme.canvasColor,
+                                      child: inputModel.isPhysicalMouse.value
+                                          ? getBodyForMobile()
+                                          : RawTouchGestureDetectorRegion(
+                                              child: getBodyForMobile(),
+                                              ffi: gFFI,
+                                            ),
+                                    );
+                                  },
+                                );
+                              },
+                            ),
                           ),
                   );
                 })
@@ -1055,6 +1147,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   //         ]));
   //   }, clickMaskDismiss: true);
   // }
+
 }
 
 class KeyHelpTools extends StatefulWidget {

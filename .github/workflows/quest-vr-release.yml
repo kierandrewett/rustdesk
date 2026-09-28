@@ -1,0 +1,17 @@
+name: Quest VR release build
+
+on:
+  push:
+    tags:
+      - 'quest-vr-*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    uses: ./.github/workflows/flutter-build.yml
+    secrets: inherit
+    with:
+      upload-artifact: true
+      upload-tag: ${{ github.ref_name }}
