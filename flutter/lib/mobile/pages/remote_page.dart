@@ -89,6 +89,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   Timer? _controllerLeftTriggerTimer;
   Timer? _controllerRightTriggerTimer;
   bool _controllerLeftTriggerPressed = false;
+  bool _controllerRightTriggerPressed = false;
   bool _controllerLeftMouseDown = false;
   bool _controllerRightMouseDown = false;
   double _controllerStickX = 0;
